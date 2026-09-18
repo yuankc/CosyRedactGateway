@@ -441,11 +441,63 @@ const GITLEAK_RULES = [
 
 export const GITLEAK_PORTABLE_RULE_COUNT = GITLEAK_RULES.length;
 
-function collectGitleakSpans(text) {
-  const out = [];
-  const lower = text.toLowerCase();
-  for (const rule of GITLEAK_RULES) {
-    if (rule.keywords.length && !rule.keywords.some((k) => lower.includes(k))) continue;
+/** 编译多关键词自动机；共享规则结构，不缓存任何请求文本或匹配结果。 */
+export function compileKeywordMatcher(keywordLists) {
+  const nodes = [{ next:new Map(), fail:0, rules:[] }];
+  const unconditional = new Uint8Array(keywordLists.length);
+  keywordLists.forEach((keywords, ruleIndex) => {
+    if (!keywords.length) unconditional[ruleIndex] = 1;
+    for (const keyword of keywords) {
+      if (!keyword.length) { unconditional[ruleIndex] = 1; continue; }
+      let state = 0;
+      for (let i=0;i<keyword.length;i++) {
+        const char = keyword[i];
+        if (!nodes[state].next.has(char)) {
+          nodes[state].next.set(char, nodes.length);
+          nodes.push({ next:new Map(), fail:0, rules:[] });
+        }
+        state = nodes[state].next.get(char);
+      }
+      nodes[state].rules.push(ruleIndex);
+    }
+  });
+  const queue = [...nodes[0].next.values()];
+  for (let i=0;i<queue.length;i++) {
+    const state = queue[i];
+    for (const [char, child] of nodes[state].next) {
+      let failure = nodes[state].fail;
+      while (failure && !nodes[failure].next.has(char)) failure = nodes[failure].fail;
+      nodes[child].fail = nodes[failure].next.get(char) ?? 0;
+      nodes[child].rules.push(...nodes[nodes[child].fail].rules);
+      queue.push(child);
+    }
+  }
+  /** 一次扫描标记所有命中规则，包含前后缀和重叠关键词；调用方保留规则执行顺序。 */
+  return function matchKeywords(text) {
+    const active = unconditional.slice();
+    const visited = new Uint8Array(nodes.length);
+    let state = 0;
+    for (let i=0;i<text.length;i++) {
+      const char = text[i];
+      while (state && !nodes[state].next.has(char)) state = nodes[state].fail;
+      state = nodes[state].next.get(char) ?? 0;
+      if (!visited[state]) {
+        visited[state] = 1;
+        for (const ruleIndex of nodes[state].rules) active[ruleIndex] = 1;
+      }
+    }
+    return active;
+  };
+}
+
+const matchGitleakKeywords = compileKeywordMatcher(GITLEAK_RULES.map(rule => rule.keywords));
+
+/** 一次筛选关键词后按原顺序执行规则，保留候选预算和优先级语义。 */
+function collectGitleakSpans(text, add) {
+  const active = matchGitleakKeywords(text.toLowerCase());
+  for (let i=0;i<GITLEAK_RULES.length;i++) {
+    if (!active[i]) continue;
+    const rule = GITLEAK_RULES[i];
     const re = rule.regex;
     re.lastIndex = 0;
     let m;
@@ -459,7 +511,7 @@ function collectGitleakSpans(text) {
       const secretLower = secret.toLowerCase();
       if (rule.stopwords.some((word) => secretLower.includes(word))) continue;
       if (rule.allowRegexes.some((allow) => { allow.lastIndex = 0; return allow.test(secret); })) continue;
-      out.push({
+      add({
         start: m.index + relative,
         end: m.index + relative + secret.length,
         type: "gitleaks",
@@ -468,71 +520,113 @@ function collectGitleakSpans(text) {
       });
     }
   }
-  return out;
 }
 
 
-function collectRegexSpans(text, regex, type, priority, validator = null) {
-  const out = [];
+/** 将通过校验的正则候选直接写入受限收集器。 */
+function collectRegexSpans(text, regex, type, priority, add, validator = null) {
   regex.lastIndex = 0;
   let m;
   while ((m = regex.exec(text))) {
     if (!m[0].length) { regex.lastIndex++; continue; }
-    if (!validator || validator(m[0])) out.push({ start:m.index, end:m.index + m[0].length, type, priority });
+    if (!validator || validator(m[0])) add({ start:m.index, end:m.index + m[0].length, type, priority });
   }
-  return out;
 }
 
-function overlaps(a, b) { return a.start < b.end && a.end > b.start; }
+/** 使用坐标压缩和前缀最大终点查询，按原优先级顺序选择不重叠区间。 */
+export function selectSensitiveSpans(candidates, protectedSpans = []) {
+  const starts = [...new Set([...candidates, ...protectedSpans].map(s => s.start))].sort((a,b) => a-b);
+  const tree = new Float64Array(starts.length + 1);
+  const lowerBound = value => {
+    let low=0, high=starts.length;
+    while (low<high) { const mid=(low+high)>>>1; if (starts[mid]<value) low=mid+1; else high=mid; }
+    return low;
+  };
+  const insert = span => {
+    for (let i=lowerBound(span.start)+1;i<tree.length;i+=i&-i) tree[i]=Math.max(tree[i],span.end);
+  };
+  for (const span of protectedSpans) insert(span);
+  candidates.sort((a,b) => b.priority-a.priority || (b.end-b.start)-(a.end-a.start) || a.start-b.start);
+  const selected=[];
+  for (const span of candidates) {
+    let end=0;
+    for (let i=lowerBound(span.end);i>0;i-=i&-i) end=Math.max(end,tree[i]);
+    if (end<=span.start) { selected.push(span); insert(span); }
+  }
+  return selected.sort((a,b) => a.start-b.start);
+}
 
-export function findSensitiveSpans(text, flags) {
-  const protectedSpans = collectRegexSpans(text, /\{\{Redact:[a-f0-9]{64}\}\}/g, "existing", 1000);
-  const c = [];
-  if (flags.secret) c.push(...collectRegexSpans(text, /\bsk-[A-Za-z0-9]{60,}\b/g, "secret", 110));
-  if (flags.email) c.push(...collectRegexSpans(text, /[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+/g, "email", 90));
-  if (flags.identity) c.push(...collectRegexSpans(text, /(?<!\d)\d{17}[0-9Xx](?!\d)/g, "identity", 100, (s) => chinaIdValid(s)));
+/** 收集受预算限制的候选；高熵单词逐个评分，保持既有规则和偏移语义。 */
+export function findSensitiveSpans(text, flags, budget = { maxCandidates:65536, candidateCount:0 }) {
+  const protectedSpans=[], candidates=[];
+  const collect = target => span => {
+    if (budget.candidateCount >= budget.maxCandidates) throw new RedactionLimitError(`Candidate limit exceeded (${budget.maxCandidates})`);
+    budget.candidateCount++;
+    target.push(span);
+  };
+  const add=collect(candidates);
+  collectRegexSpans(text, /\{\{Redact:[a-f0-9]{64}\}\}/g, "existing", 1000, collect(protectedSpans));
+  if (flags.secret) collectRegexSpans(text, /\bsk-[A-Za-z0-9]{60,}\b/g, "secret", 110, add);
+  if (flags.email) collectRegexSpans(text, /[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+/g, "email", 90, add);
+  if (flags.identity) collectRegexSpans(text, /(?<!\d)\d{17}[0-9Xx](?!\d)/g, "identity", 100, add, (s) => chinaIdValid(s));
   if (flags.bank) {
     const bankValid = (s) => { const d=s.replace(/\D/g,""); return d.length>=13 && d.length<=19 && luhnValid(d); };
-    c.push(...collectRegexSpans(text, /(?<!\d)\d{13,19}(?!\d)/g, "bank", 85, bankValid));
-    c.push(...collectRegexSpans(text, /(?<!\d)\d{4}(?:[ -]\d{4}){2,3}(?:[ -]\d{1,3})?(?!\d)/g, "bank", 85, bankValid));
+    collectRegexSpans(text, /(?<!\d)\d{13,19}(?!\d)/g, "bank", 85, add, bankValid);
+    collectRegexSpans(text, /(?<!\d)\d{4}(?:[ -]\d{4}){2,3}(?:[ -]\d{1,3})?(?!\d)/g, "bank", 85, add, bankValid);
   }
   if (flags.phone) {
-    c.push(...collectRegexSpans(text, /(?<!\d)1[3-9]\d{9}(?!\d)/g, "phone", 88));
-    c.push(...collectRegexSpans(text, /(?<!\d)\+(?:\d[ .()\-]?){7,14}\d(?!\d)/g, "phone", 88));
+    collectRegexSpans(text, /(?<!\d)1[3-9]\d{9}(?!\d)/g, "phone", 88, add);
+    collectRegexSpans(text, /(?<!\d)\+(?:\d[ .()\-]?){7,14}\d(?!\d)/g, "phone", 88, add);
   }
-  if (flags.gitleaks) c.push(...collectGitleakSpans(text));
-  if (flags.highEntropy) for (const b of tokenizeBlocks(text)) if (isHighEntropyBlock(b.value)) c.push({ start:b.start, end:b.end, type:"entropy", priority:10 });
-
-  const candidates = c.filter((x) => !protectedSpans.some((p) => overlaps(x, p)));
-  candidates.sort((a,b) => b.priority-a.priority || (b.end-b.start)-(a.end-a.start) || a.start-b.start);
-  const selected = [];
-  for (const s of candidates) if (!selected.some((x) => overlaps(s,x))) selected.push(s);
-  return selected.sort((a,b) => a.start-b.start);
+  if (flags.gitleaks) collectGitleakSpans(text, add);
+  if (flags.highEntropy) {
+    const blocks=/[A-Za-z0-9]{9,}/g;
+    let match;
+    while ((match=blocks.exec(text))) {
+      if (isHighEntropyBlock(match[0])) add({ start:match.index, end:match.index+match[0].length, type:"entropy", priority:10 });
+    }
+  }
+  return selectSensitiveSpans(candidates,protectedSpans);
 }
 
 export class RedactionLimitError extends Error {}
 
+/** 使用 Web Crypto 生成 UTF-8 文本摘要，供 Worker、Deno 和默认调用路径使用。 */
+async function webSha256Hex(value) {
+  const digest = await crypto.subtle.digest("SHA-256", textEncoder.encode(value));
+  return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2,"0")).join("");
+}
+
 export class RedactionContext {
-  constructor({ salt = getRuntimeSalt(), maxRedactions = DEFAULT_MAX_REDACTIONS, parseNestedJson = true } = {}) {
+  /** 保存单请求映射和取消信号，不在请求之间共享敏感原文。 */
+  constructor({ salt = getRuntimeSalt(), maxRedactions = DEFAULT_MAX_REDACTIONS, parseNestedJson = true, signal, maxCandidates = 65536, digestHex = webSha256Hex } = {}) {
     this.salt = salt;
+    this.digestHex = digestHex;
     this.maxRedactions = maxRedactions;
     this.parseNestedJson = parseNestedJson;
+    this.signal = signal;
+    this.maxCandidates = maxCandidates;
+    this.candidateCount = 0;
     this.rawToToken = new Map();
     this.tokenToRaw = new Map();
   }
+  /** 生成或复用占位符；取消后不再计算下一项或写回敏感映射。 */
   async tokenFor(raw) {
+    this.signal?.throwIfAborted();
     if (this.rawToToken.has(raw)) return this.rawToToken.get(raw);
     if (this.rawToToken.size >= this.maxRedactions) throw new RedactionLimitError(`Redaction limit exceeded (${this.maxRedactions})`);
-    const digest = await crypto.subtle.digest("SHA-256", textEncoder.encode(raw + this.salt));
-    const hex = Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2,"0")).join("");
+    const hex = await this.digestHex(raw + this.salt, this.signal);
+    this.signal?.throwIfAborted();
     const token = TOKEN_PREFIX + hex + TOKEN_SUFFIX;
     const collision = this.tokenToRaw.get(token);
     if (collision !== undefined && collision !== raw) throw new Error("SHA-256 redaction token collision");
     this.rawToToken.set(raw, token); this.tokenToRaw.set(token, raw);
     return token;
   }
+  /** 按既有规则替换文本，并在进入同步扫描前检查取消状态。 */
   async redactText(text, flags) {
-    const spans = findSensitiveSpans(text, flags);
+    this.signal?.throwIfAborted();
+    const spans = findSensitiveSpans(text, flags, this);
     if (!spans.length) return text;
     let out = "", at = 0;
     for (const s of spans) {
@@ -557,7 +651,9 @@ function shouldSkipString(path) {
   return false;
 }
 
+/** 递归脱敏 JSON；取消和脱敏限制错误必须向上传递，不能按普通文本重试。 */
 export async function redactJson(value, ctx, flags, path = []) {
+  ctx.signal?.throwIfAborted();
   if (typeof value === "string") {
     if (!shouldSkipString(path) && ctx.parseNestedJson && /^[\s]*[\[{]/.test(value)) {
       try {
@@ -566,7 +662,10 @@ export async function redactJson(value, ctx, flags, path = []) {
           const redacted = await redactJson(nested, ctx, flags, path.concat("<nested-json>"));
           return JSON.stringify(redacted);
         }
-      } catch { /* Treat non-JSON strings as ordinary text. */ }
+      } catch (e) {
+        if (e instanceof RedactionLimitError || ctx.signal?.aborted) throw e;
+        /* Treat non-JSON strings as ordinary text. */
+      }
     }
     return shouldSkipString(path) ? value : ctx.redactText(value, flags);
   }
@@ -667,7 +766,56 @@ function corsPreflight(request, origin = "*") {
   return new Response(null, { status:204, headers:h });
 }
 
-function intSetting(v, fallback) { const n = Number(v); return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback; }
+/** 只接受正整数上限，避免小数取整为零后禁用处理槽位或超时。 */
+function intSetting(v, fallback) { const n = Number(v); return Number.isSafeInteger(n) && n > 0 ? n : fallback; }
+
+class RedactionBusyError extends Error {}
+let activeRedactions=0;
+const redactionWaiters=[];
+
+/** 按 FIFO 分配脱敏槽位；释放函数幂等，排队不持有已读入的请求体。 */
+function drainRedactionQueue() {
+  while (redactionWaiters.length && activeRedactions<redactionWaiters[0].maxActive) {
+    const next=redactionWaiters.shift();
+    clearTimeout(next.timer);
+    next.signal.removeEventListener("abort",next.abort);
+    activeRedactions++;
+    let released=false;
+    next.resolve(() => {
+      if (released) return;
+      released=true;
+      activeRedactions--;
+      drainRedactionQueue();
+    });
+  }
+}
+
+/** 在读取请求体之前限流；队列满、等待超时或取消时及时拒绝并移除等待项。 */
+function acquireRedactionSlot(env, signal) {
+  signal.throwIfAborted();
+  const maxActive=intSetting(env?.REDACT_MAX_CONCURRENT,8);
+  const maxQueue=intSetting(env?.REDACT_MAX_QUEUE,16);
+  const timeout=intSetting(env?.REDACT_QUEUE_TIMEOUT_MS,5000);
+  if (redactionWaiters.length>=maxQueue) throw new RedactionBusyError("Redaction queue is full");
+  return new Promise((resolve,reject) => {
+    const entry={maxActive,signal,resolve,timer:null,abort:null};
+    const remove=error => {
+      const index=redactionWaiters.indexOf(entry);
+      if (index<0) return;
+      redactionWaiters.splice(index,1);
+      clearTimeout(entry.timer);
+      signal.removeEventListener("abort",entry.abort);
+      reject(error);
+      drainRedactionQueue();
+    };
+    entry.abort=() => remove(signal.reason);
+    entry.timer=setTimeout(() => remove(new RedactionBusyError(`Redaction queue timeout (${timeout} ms)`)),timeout);
+    signal.addEventListener("abort",entry.abort,{once:true});
+    redactionWaiters.push(entry);
+    drainRedactionQueue();
+  });
+}
+
 function allowedHost(upstream, env) {
   const raw = env?.REDACT_ALLOWED_HOSTS;
   if (!raw) return true;
@@ -675,6 +823,95 @@ function allowedHost(upstream, env) {
   return allow.some((h) => upstream.hostname.toLowerCase() === h || upstream.hostname.toLowerCase().endsWith("." + h));
 }
 function jsonError(status, message) { return new Response(JSON.stringify({ error: { message, type:"cosy_redact_gateway_error" } }), { status, headers:{"content-type":"application/json; charset=utf-8"} }); }
+
+/** 在读取前检查声明长度，读取中按实际字节限量；拒绝后立即停止拉取。 */
+async function readLimitedBody(request, maxBytes, signal) {
+  signal.throwIfAborted();
+  const declared = request.headers.get("content-length");
+  const tooLarge = () => new RedactionLimitError(`Request body exceeds ${maxBytes} bytes`);
+  if (declared && /^\d+$/.test(declared.trim()) && Number(declared) > maxBytes) {
+    const error = tooLarge();
+    void request.body?.cancel(error).catch(() => {});
+    throw error;
+  }
+  if (!request.body) return new Uint8Array(0);
+  const reader = request.body.getReader();
+  const cancel = () => { void reader.cancel(signal.reason).catch(() => {}); };
+  signal.addEventListener("abort", cancel, { once:true });
+  const chunks = [];
+  let length = 0;
+  try {
+    while (true) {
+      signal.throwIfAborted();
+      const { done, value } = await reader.read();
+      signal.throwIfAborted();
+      if (done) break;
+      length += value.byteLength;
+      if (length > maxBytes) {
+        const error = tooLarge();
+        void reader.cancel(error).catch(() => {});
+        throw error;
+      }
+      chunks.push(value);
+    }
+    const bytes = new Uint8Array(length);
+    let offset = 0;
+    for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+    return bytes;
+  } finally {
+    signal.removeEventListener("abort", cancel);
+    reader.releaseLock();
+  }
+}
+
+/** 只在等待上游下一块数据时计时；背压暂停期间不误判上游空闲。 */
+function guardUpstreamBody(body, abortController, idleTimeout, onFinish = () => {}) {
+  const reader = body.getReader();
+  const signal = abortController.signal;
+  let timer, closed = false, downstream;
+  const finish = (error, cancelSource = false) => {
+    if (closed) return;
+    closed = true;
+    clearTimeout(timer);
+    signal.removeEventListener("abort", aborted);
+    if (cancelSource) void reader.cancel(error).catch(() => {});
+    reader.releaseLock();
+    onFinish(error);
+  };
+  const aborted = () => {
+    if (closed) return;
+    downstream.error(signal.reason);
+    finish(signal.reason, true);
+  };
+  return new ReadableStream({
+    start(controller) {
+      downstream = controller;
+      signal.addEventListener("abort", aborted, { once:true });
+      if (signal.aborted) aborted();
+    },
+    async pull(controller) {
+      if (closed) return;
+      if (idleTimeout > 0) timer = setTimeout(() => abortController.abort(new DOMException(`Upstream body idle timeout (${idleTimeout} ms)`, "TimeoutError")), idleTimeout);
+      try {
+        const result = await reader.read();
+        clearTimeout(timer);
+        if (closed) return;
+        if (result.done) { controller.close(); finish(); }
+        else controller.enqueue(result.value);
+      } catch (error) {
+        if (closed) return;
+        controller.error(error);
+        finish(error, true);
+        abortController.abort(error);
+      }
+    },
+    cancel(reason) {
+      const error = reason ?? new DOMException("Response cancelled", "AbortError");
+      finish(error, true);
+      abortController.abort(error);
+    }
+  }, { highWaterMark:0 });
+}
 
 function isJsonContentType(ct) { return /(^|[+\/])json(?:$|[; ])/i.test(ct || "") || /application\/.*\+json/i.test(ct || ""); }
 function isTextualContentType(ct) { return isJsonContentType(ct) || /^text\//i.test(ct || "") || /javascript|xml/i.test(ct || ""); }
@@ -754,17 +991,26 @@ function restoreCompleteStrings(value, ctx, excluded = new Set(), path = []) {
 }
 
 class SseRestorer {
-  constructor(ctx) { this.ctx=ctx; this.channels=new Map(); this.queue=[]; }
+  /** 为待恢复事件设置数量和原始 UTF-8 字节预算。 */
+  constructor(ctx, { maxEventBytes=1048576, maxQueueEvents=1024, maxQueueBytes=4194304 } = {}) {
+    this.ctx=ctx; this.channels=new Map(); this.queue=[]; this.queuedBytes=0;
+    this.maxEventBytes=maxEventBytes; this.maxQueueEvents=maxQueueEvents; this.maxQueueBytes=maxQueueBytes;
+  }
+  /** 校验缓冲预算后解析事件；超限抛错，不能跳过恢复或继续透传。 */
   ingest(raw) {
+    const bytes=textEncoder.encode(raw).byteLength;
+    if (bytes>this.maxEventBytes) throw new RedactionLimitError(`SSE event exceeds ${this.maxEventBytes} bytes`);
+    if (this.queue.length>=this.maxQueueEvents || this.queuedBytes+bytes>this.maxQueueBytes) throw new RedactionLimitError("SSE pending queue limit exceeded");
+    this.queuedBytes+=bytes;
     const parsed=parseSseEvent(raw);
     const payload=parsed.dataText;
-    if (!payload || payload === "[DONE]") { this.queue.push({safe:true, output:raw+"\n\n"}); return this.drain(); }
+    if (!payload || payload === "[DONE]") { this.queue.push({safe:true, bytes, output:raw+"\n\n"}); return this.drain(); }
     let data;
-    try { data=JSON.parse(payload); } catch { this.queue.push({safe:true, output:serializeSseEvent(parsed,this.ctx.restoreText(payload))}); return this.drain(); }
+    try { data=JSON.parse(payload); } catch { this.queue.push({safe:true, bytes, output:serializeSseEvent(parsed,this.ctx.restoreText(payload))}); return this.drain(); }
     const fields=streamFields(data, parsed.eventName);
     const excluded=new Set(fields.map((f)=>f.path.join(".")));
     restoreCompleteStrings(data,this.ctx,excluded);
-    const ev={safe:fields.length===0,pending:fields.length,parsed,data,output:null};
+    const ev={safe:fields.length===0,pending:fields.length,parsed,data,output:null,bytes};
     this.queue.push(ev);
     const affected=new Set();
     for (const f of fields) {
@@ -775,6 +1021,7 @@ class SseRestorer {
     for (const key of affected) this.maybeFlushChannel(key,false);
     return this.drain();
   }
+  /** 完整占位符恢复后删除空通道，避免已结束通道标识长期积累。 */
   maybeFlushChannel(key,force) {
     const ch=this.channels.get(key); if (!ch || !ch.records.length) return;
     if (!force && possibleTokenSuffixLength(ch.text)>0) return;
@@ -783,12 +1030,15 @@ class SseRestorer {
     const last=ch.records[ch.records.length-1]; last.parent[last.key]=restored;
     for (const r of ch.records) { r.ev.pending--; if (r.ev.pending===0) r.ev.safe=true; }
     ch.text=""; ch.records=[];
+    this.channels.delete(key);
   }
   finish() { for (const key of this.channels.keys()) this.maybeFlushChannel(key,true); return this.drain(true); }
+  /** 按原事件顺序输出，并释放对应的队列预算。 */
   drain(force=false) {
     let out="";
     while (this.queue.length && (this.queue[0].safe || force)) {
       const ev=this.queue.shift();
+      this.queuedBytes-=ev.bytes;
       if (ev.output != null) out += ev.output;
       else if (ev.data !== undefined) out += serializeSseEvent(ev.parsed, JSON.stringify(ev.data));
       else out += ev.parsed?.raw ? ev.parsed.raw+"\n\n" : "";
@@ -797,19 +1047,59 @@ class SseRestorer {
   }
 }
 
-export function restoreSseStream(body, ctx) {
+/** 按需恢复 SSE；结束、取消或出错时清理队列并通知请求生命周期结束。 */
+export function restoreSseStream(body, ctx, { signal, onFinish = () => {}, idleTimeout=0, maxEventBytes=1048576, maxQueueEvents=1024, maxQueueBytes=4194304 } = {}) {
   const reader=body.getReader();
   const decoder=new TextDecoder();
   const encoder=new TextEncoder();
-  const restorer=new SseRestorer(ctx);
+  const restorer=new SseRestorer(ctx,{maxEventBytes,maxQueueEvents,maxQueueBytes});
   let buffer="";
   let upstreamDone=false;
   let restorerFinished=false;
+  let closed=false, downstream;
+  let pendingChunk=null, chunkOffset=0;
+  let readTimer;
+  let waitingSince=null;
+
+  // 同一响应复用空闲检查计时器，避免为每个很小的网络分块分配计时器。
+  function checkIdle() {
+    readTimer=undefined;
+    if (closed || waitingSince===null) return;
+    const remaining=idleTimeout-(performance.now()-waitingSince);
+    if (remaining>0) { readTimer=setTimeout(checkIdle,remaining); return; }
+    const error=new DOMException(`Upstream body idle timeout (${idleTimeout} ms)`,"TimeoutError");
+    downstream.error(error);
+    finish(error,true);
+  }
+
+  function finish(error, cancelSource=false) {
+    if (closed) return;
+    closed=true;
+    clearTimeout(readTimer);
+    signal?.removeEventListener("abort", aborted);
+    buffer="";
+    pendingChunk=null;
+    restorer.channels.clear(); restorer.queue.length=0; restorer.queuedBytes=0;
+    if (cancelSource) void reader.cancel(error).catch(() => {});
+    reader.releaseLock();
+    onFinish(error);
+  }
+  function aborted() {
+    if (closed) return;
+    downstream.error(signal.reason);
+    finish(signal.reason,true);
+  }
 
   function normalize() { buffer=buffer.replace(/\r\n/g,"\n"); }
 
   return new ReadableStream({
+    start(controller) {
+      downstream=controller;
+      signal?.addEventListener("abort",aborted,{once:true});
+      if (signal?.aborted) aborted();
+    },
     async pull(controller) {
+      if (closed) return;
       try {
         while (true) {
           const idx=buffer.indexOf("\n\n");
@@ -834,26 +1124,42 @@ export function restoreSseStream(body, ctx) {
               if (final) { controller.enqueue(encoder.encode(final)); return; }
             }
             controller.close();
+            finish();
             return;
           }
 
+          if (pendingChunk) {
+            const end=Math.min(chunkOffset+16384,pendingChunk.byteLength);
+            buffer += decoder.decode(pendingChunk.subarray(chunkOffset,end),{stream:true});
+            chunkOffset=end;
+            if (chunkOffset===pendingChunk.byteLength) pendingChunk=null;
+            normalize();
+            if (buffer.indexOf("\n\n")<0 && textEncoder.encode(buffer).byteLength>maxEventBytes) throw new RedactionLimitError(`SSE event exceeds ${maxEventBytes} bytes`);
+            continue;
+          }
+          if (idleTimeout>0) {
+            waitingSince=performance.now();
+            if (readTimer===undefined) readTimer=setTimeout(checkIdle,idleTimeout);
+          }
           const {done,value}=await reader.read();
+          waitingSince=null;
+          if (closed) return;
           if (done) {
             buffer += decoder.decode();
             normalize();
             upstreamDone=true;
           } else {
-            buffer += decoder.decode(value,{stream:true});
-            normalize();
+            pendingChunk=value; chunkOffset=0;
           }
         }
       } catch (e) {
+        if (closed) return;
         controller.error(e);
-        try { await reader.cancel(e); } catch {}
+        finish(e,true);
       }
     },
-    async cancel(reason) { try { await reader.cancel(reason); } catch {} }
-  });
+    cancel(reason) { finish(reason ?? new DOMException("Response cancelled","AbortError"),true); }
+  }, { highWaterMark:0 });
 }
 
 async function restoreNonStreamResponse(upstreamResponse, ctx, corsOrigin) {
@@ -869,6 +1175,7 @@ async function restoreNonStreamResponse(upstreamResponse, ctx, corsOrigin) {
   return new Response(out,{status:upstreamResponse.status,statusText:upstreamResponse.statusText,headers});
 }
 
+/** 限量读取和脱敏请求，串联客户端取消、上游超时及响应资源清理。 */
 export async function handleRequest(request, env = {}, options = {}) {
   const corsOrigin=env?.REDACT_CORS_ORIGIN || "*";
   if (request.method === "OPTIONS") return corsPreflight(request,corsOrigin);
@@ -884,38 +1191,95 @@ export async function handleRequest(request, env = {}, options = {}) {
 
   const maxBody=intSetting(env?.REDACT_MAX_BODY_BYTES,DEFAULT_MAX_BODY_BYTES);
   const maxRedactions=intSetting(env?.REDACT_MAX_REDACTIONS,DEFAULT_MAX_REDACTIONS);
+  const headerTimeout=intSetting(env?.REDACT_UPSTREAM_HEADER_TIMEOUT_MS,120000);
+  const idleTimeout=intSetting(env?.REDACT_UPSTREAM_IDLE_TIMEOUT_MS,120000);
   const parseNestedJson = !/^(0|false|no|off)$/i.test(String(env?.REDACT_PARSE_NESTED_JSON ?? "true"));
-  const ctx=new RedactionContext({salt:options.salt || getRuntimeSalt(),maxRedactions,parseNestedJson});
-  const headers=filteredRequestHeaders(request.headers);
-  let body;
-  if (request.method !== "GET" && request.method !== "HEAD") {
-    const bytes=await request.arrayBuffer();
-    if (bytes.byteLength > maxBody) return jsonError(413,`Request body exceeds ${maxBody} bytes`);
-    const ct=request.headers.get("content-type") || "";
-    if (bytes.byteLength && !isJsonContentType(ct)) return jsonError(415,"For safety, request bodies must be JSON so they can be redacted before forwarding");
-    if (bytes.byteLength) {
-      let data;
-      try { data=JSON.parse(new TextDecoder().decode(bytes)); } catch { return jsonError(400,"Invalid JSON request body"); }
-      try {
+  const abortController=new AbortController();
+  const signal=abortController.signal;
+  const aborted=() => abortController.abort(request.signal.reason);
+  request.signal.addEventListener("abort",aborted,{once:true});
+  if (request.signal.aborted) aborted();
+  const ctx=new RedactionContext({salt:options.salt || getRuntimeSalt(),maxRedactions,parseNestedJson,signal,digestHex:options.digestHex,maxCandidates:intSetting(env?.REDACT_MAX_CANDIDATES,65536)});
+  let timer, releaseSlot, streaming=false, stage="request";
+  const cleanup=() => {
+    clearTimeout(timer);
+    request.signal.removeEventListener("abort",aborted);
+    ctx.rawToToken.clear(); ctx.tokenToRaw.clear();
+  };
+  const finishResponse=(error) => {
+    if (error !== undefined) abortController.abort(error);
+    cleanup();
+  };
+  try {
+    signal.throwIfAborted();
+    const headers=filteredRequestHeaders(request.headers);
+    let body;
+    if (request.method !== "GET" && request.method !== "HEAD") {
+      releaseSlot=await acquireRedactionSlot(env,signal);
+      const bytes=await readLimitedBody(request,maxBody,signal);
+      const ct=request.headers.get("content-type") || "";
+      if (bytes.byteLength && !isJsonContentType(ct)) return jsonError(415,"For safety, request bodies must be JSON so they can be redacted before forwarding");
+      if (bytes.byteLength) {
+        let data;
+        try { data=JSON.parse(new TextDecoder().decode(bytes)); } catch { return jsonError(400,"Invalid JSON request body"); }
         data=await redactJson(data,ctx,target.flags);
         const protocol=detectProtocol(data,target.upstream,request.headers);
         injectRedactNotice(data,protocol);
-      } catch(e) { if (e instanceof RedactionLimitError) return jsonError(413,e.message); throw e; }
-      body=JSON.stringify(data); headers.set("content-type","application/json"); headers.delete("content-length");
-    } else body="";
+        body=JSON.stringify(data); headers.set("content-type","application/json"); headers.delete("content-length");
+      } else body="";
+      releaseSlot(); releaseSlot=undefined;
+    }
+    signal.throwIfAborted();
+    stage="upstream";
+    timer=setTimeout(() => abortController.abort(new DOMException(`Upstream header timeout (${headerTimeout} ms)`,"TimeoutError")),headerTimeout);
+    const fetchImpl=options.fetchImpl || fetch;
+    const upstreamResponse=await fetchImpl(target.upstream.toString(),{method:request.method,headers,body,redirect:"manual",signal});
+    clearTimeout(timer);
+    if (signal.aborted) {
+      void upstreamResponse.body?.cancel(signal.reason).catch(() => {});
+      signal.throwIfAborted();
+    }
+    const responseCt=upstreamResponse.headers.get("content-type") || "";
+    const sse=/text\/event-stream/i.test(responseCt);
+    const passthrough=!sse && !isTextualContentType(responseCt);
+    if (upstreamResponse.body) {
+      const responseInit={status:upstreamResponse.status,statusText:upstreamResponse.statusText,headers:upstreamResponse.headers};
+      if (sse) {
+        const rh=withCors(upstreamResponse.headers,corsOrigin); rh.delete("content-length"); rh.delete("content-encoding");
+        const response=new Response(restoreSseStream(upstreamResponse.body,ctx,{
+          signal,onFinish:finishResponse,idleTimeout,
+          maxEventBytes:intSetting(env?.REDACT_MAX_SSE_EVENT_BYTES,1048576),
+          maxQueueEvents:intSetting(env?.REDACT_MAX_SSE_QUEUE_EVENTS,1024),
+          maxQueueBytes:intSetting(env?.REDACT_MAX_SSE_QUEUE_BYTES,4194304)
+        }),{...responseInit,headers:rh});
+        streaming=true;
+        return response;
+      }
+      const guarded=guardUpstreamBody(upstreamResponse.body,abortController,idleTimeout,passthrough ? finishResponse : undefined);
+      const response=await restoreNonStreamResponse(new Response(guarded,responseInit),ctx,corsOrigin);
+      signal.throwIfAborted();
+      streaming=passthrough;
+      return response;
+    }
+    return await restoreNonStreamResponse(upstreamResponse,ctx,corsOrigin);
+  } catch (error) {
+    if (stage === "request" && request.body && !request.body.locked) void request.body.cancel(error).catch(() => {});
+    if (error instanceof RedactionBusyError) {
+      const response=jsonError(503,error.message);
+      response.headers.set("retry-after","1");
+      return response;
+    }
+    if (error instanceof RedactionLimitError) return jsonError(413,error.message);
+    if (signal.aborted) return jsonError(signal.reason?.name === "TimeoutError" ? 504 : 499,signal.reason?.message || "Request cancelled");
+    if (stage === "upstream") {
+      abortController.abort(error);
+      return jsonError(502,`Upstream fetch failed: ${error?.message || error}`);
+    }
+    throw error;
+  } finally {
+    releaseSlot?.();
+    if (!streaming) cleanup();
   }
-
-  const fetchImpl=options.fetchImpl || fetch;
-  let upstreamResponse;
-  try { upstreamResponse=await fetchImpl(target.upstream.toString(),{method:request.method,headers,body,redirect:"manual"}); }
-  catch(e) { return jsonError(502,`Upstream fetch failed: ${e?.message || e}`); }
-
-  const responseCt=upstreamResponse.headers.get("content-type") || "";
-  if (/text\/event-stream/i.test(responseCt) && upstreamResponse.body) {
-    const rh=withCors(upstreamResponse.headers,corsOrigin); rh.delete("content-length"); rh.delete("content-encoding");
-    return new Response(restoreSseStream(upstreamResponse.body,ctx),{status:upstreamResponse.status,statusText:upstreamResponse.statusText,headers:rh});
-  }
-  return restoreNonStreamResponse(upstreamResponse,ctx,corsOrigin);
 }
 
 export default { fetch(request, env, ctx) { return handleRequest(request,env); } };

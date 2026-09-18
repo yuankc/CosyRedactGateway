@@ -133,6 +133,15 @@ npm run entropy-report
 | `REDACT_PARSE_NESTED_JSON` | `true` | 递归脱敏看起来像 JSON 的字符串，包括工具参数。 |
 | `REDACT_MAX_BODY_BYTES` | `16777216`（16 MiB） | 用于 JSON 脱敏的最大缓冲请求体。 |
 | `REDACT_MAX_REDACTIONS` | `16384` | 每个请求允许替换的不同原文数量上限。 |
+| `REDACT_MAX_CANDIDATES` | `65536` | 单请求所有 JSON 字符串累计的候选预算，包含重叠候选与受保护占位符。 |
+| `REDACT_UPSTREAM_HEADER_TIMEOUT_MS` | `120000` | 等待上游响应头的最长时间，单位毫秒。 |
+| `REDACT_UPSTREAM_IDLE_TIMEOUT_MS` | `120000` | 等待上游下一块响应数据的最长时间；下游背压暂停期间不计时。 |
+| `REDACT_MAX_SSE_EVENT_BYTES` | `1048576`（1 MiB） | 单个规范化 SSE 事件的 UTF-8 字节上限，不包含空行分隔符。 |
+| `REDACT_MAX_SSE_QUEUE_EVENTS` | `1024` | 等待占位符恢复的最大排队事件数。 |
+| `REDACT_MAX_SSE_QUEUE_BYTES` | `4194304`（4 MiB） | 待恢复队列中规范化原始事件的累计字节上限，不等同于实际堆内存。 |
+| `REDACT_MAX_CONCURRENT` | `8` | 单运行实例同时读取请求体和脱敏的数量；发起上游请求前释放槽位。 |
+| `REDACT_MAX_QUEUE` | `16` | 等待脱敏的最大请求数，入场前不读取请求体。 |
+| `REDACT_QUEUE_TIMEOUT_MS` | `5000` | 等待脱敏槽位的最长时间，单位毫秒。 |
 | `REDACT_CORS_ORIGIN` | `*` | `Access-Control-Allow-Origin` 的值。 |
 | `HOST` | `127.0.0.1` | 仅用于 Node 开发适配器。 |
 | `PORT` | `8787` | 仅用于 Node 开发适配器。 |
@@ -140,6 +149,11 @@ npm run entropy-report
 变量应配置在实际执行网关的运行时。仅在本地部署 Shell 设置变量，不会自动填充线上 Cloudflare Worker 变量。直接执行 Deno 时通过 `Deno.env.toObject()` 读取环境；`--allow-env` 允许该访问。
 
 转发前需要取得请求体以便解析和脱敏。在内存受限环境中应降低请求体和替换数量限制。这些限制不能替代外部请求体上限、并发控制或限流。
+
+
+请求体先检查 Content-Length，再按实际读取字节累计限量。请求体或候选超限返回 413，不转发部分脱敏结果；队列满或排队超时返回 503，并附 Retry-After。返回响应之前的上游超时返回 504；SSE 或二进制流开始之后的超时、缓冲超限会终止流，不伪造正常结束标记。上述数值上限和超时配置须为正整数；无效值、非整数或非正值使用默认值。
+
+Node 适配器传播连接断开和响应背压。取消后释放敏感映射和流队列；正在执行的同步正则扫描或摘要计算无法强制抢占，会在后续取消检查点停止继续处理。并发限制按单运行实例生效，不是分布式限流；已进入上游响应阶段的连接不计入脱敏槽位。普通 JSON 响应仍需完整缓冲。Cloudflare/Deno 的客户端断开传播取决于运行时是否正确触发 Request.signal。
 
 <a id="deployment-boundary"></a>
 ## 部署信任边界
@@ -159,3 +173,7 @@ npm run entropy-report
 ---
 
 [返回中文 README](../README.md) · [English reference](REFERENCE.en.md) · [English README](../README.en.md)
+
+## Node 摘要实现
+
+Node HTTP 适配器通过 `node-crypto.mjs` 使用原生 SHA-256，首次摘要前及之后每 64 个新摘要让出事件循环以响应取消。UTF-8 编码、盐值拼接、占位符格式和单请求映射保持不变。Worker/Deno 仍使用 Web Crypto，`worker.js` 不引入 Node 依赖。直接调用 `handleRequest` 默认使用 Web Crypto；只有可信调用方传入内部 `options.digestHex` 才会替换实现，该选项不来自请求或环境变量。

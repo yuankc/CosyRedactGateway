@@ -23,7 +23,8 @@ test("node-server adapter proxies through a real HTTP socket", async (t)=>{
   const proxyPort=await freePort();
   const child=spawn(process.execPath,["node-server.mjs"],{
     cwd:new URL("..",import.meta.url),
-    env:{...process.env,HOST:"127.0.0.1",PORT:String(proxyPort)},
+    // 仅测试子进程允许访问本机模拟上游。
+    env:{...process.env,HOST:"127.0.0.1",PORT:String(proxyPort),REDACT_BLOCK_PRIVATE_UPSTREAMS:"false"},
     stdio:["ignore","pipe","pipe"]
   });
   t.after(async()=>{child.kill("SIGTERM"); await close(upstream);});

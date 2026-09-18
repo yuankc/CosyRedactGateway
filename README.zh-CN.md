@@ -275,6 +275,7 @@ https://<cosy-host>/<flags>$<full-upstream-url>
 按数据特点选择开关，再评估误报与漏报。校验码命中不证明账户或身份真实存在。`G` 是适合 serverless 的兼容实现，不承诺与 Gitleaks CLI 完全等价。[检测器细节 →](docs/REFERENCE.md#detectors)
 
 <a id="compatibility"></a>
+
 ## 协议与流式处理
 
 | API 家族 | 请求处理 | 响应处理 |

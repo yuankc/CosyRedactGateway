@@ -7,7 +7,10 @@
   "scripts": {
     "test": "node --test",
     "start": "node node-server.mjs",
-    "entropy-report": "node scripts/entropy-report.mjs"
+    "entropy-report": "node scripts/entropy-report.mjs",
+    "bench": "node scripts/benchmark.mjs",
+    "bench:baseline": "node scripts/benchmark.mjs --output .benchmarks/baseline.json",
+    "bench:compare": "node scripts/benchmark.mjs --compare .benchmarks/baseline.json --output .benchmarks/current.json"
   },
   "engines": {
     "node": ">=20"

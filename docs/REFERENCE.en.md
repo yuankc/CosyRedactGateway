@@ -133,6 +133,15 @@ npm run entropy-report
 | `REDACT_PARSE_NESTED_JSON` | `true` | Recursively redact JSON-looking strings, including tool arguments. |
 | `REDACT_MAX_BODY_BYTES` | `16777216` (16 MiB) | Maximum buffered request body accepted for JSON redaction. |
 | `REDACT_MAX_REDACTIONS` | `16384` | Maximum unique plaintext replacements per request. |
+| `REDACT_MAX_CANDIDATES` | `65536` | Per-request candidate budget across all JSON strings, including overlapping candidates and protected placeholders. |
+| `REDACT_UPSTREAM_HEADER_TIMEOUT_MS` | `120000` | Maximum wait for upstream response headers. |
+| `REDACT_UPSTREAM_IDLE_TIMEOUT_MS` | `120000` | Maximum pending upstream body read; downstream backpressure pauses this clock. |
+| `REDACT_MAX_SSE_EVENT_BYTES` | `1048576` | Maximum normalized UTF-8 bytes per SSE event, excluding the blank delimiter. |
+| `REDACT_MAX_SSE_QUEUE_EVENTS` | `1024` | Maximum queued events awaiting placeholder restoration. |
+| `REDACT_MAX_SSE_QUEUE_BYTES` | `4194304` | Maximum total normalized raw-event bytes in that queue, not a heap-size measurement. |
+| `REDACT_MAX_CONCURRENT` | `8` | Concurrent request body reads/redactions per runtime isolate; slot released before upstream fetch. |
+| `REDACT_MAX_QUEUE` | `16` | Pending redaction requests; bodies are not read until admitted. |
+| `REDACT_QUEUE_TIMEOUT_MS` | `5000` | Maximum wait for a redaction slot. |
 | `REDACT_CORS_ORIGIN` | `*` | `Access-Control-Allow-Origin` value. |
 | `HOST` | `127.0.0.1` | Node development adapter only. |
 | `PORT` | `8787` | Node development adapter only. |
@@ -140,6 +149,11 @@ npm run entropy-report
 Configure variables in the runtime that actually executes the gateway. Cloudflare Worker variables are not automatically populated by setting a variable in a local deployment shell. Direct Deno execution reads its environment with `Deno.env.toObject()`; `--allow-env` enables that access.
 
 The request must be available for parsing and redaction before forwarding. Lower body and replacement limits for memory-constrained environments. Limits do not replace an external request-size cap, concurrency control, or rate limiting.
+
+
+Request size is checked against Content-Length first and against actual bytes while reading. Oversize requests and candidate limits return 413 without forwarding partially redacted data. Queue saturation or timeout returns 503 with Retry-After. Upstream timeouts before a response is returned produce 504; after SSE/opaque streaming begins, errors terminate the stream instead of emitting a successful end marker. Numeric limits/timeouts accept positive integers; invalid, fractional or nonpositive values use defaults.
+
+The Node adapter propagates socket disconnects and response backpressure. Cancellation releases request mappings and stream queues; an in-progress synchronous regex scan or digest cannot be preempted, but further work stops at cancellation checkpoints. These are per-isolate limits, not a distributed limiter; upstream streaming connections are not counted by the redaction gate. Normal JSON responses are still fully buffered. Actual Cloudflare/Deno cancellation depends on the runtime's Request.signal behavior.
 
 <a id="deployment-boundary"></a>
 ## Deployment boundary
@@ -159,3 +173,7 @@ Refer to the existing [SECURITY.md](../SECURITY.md) for project security-reporti
 ---
 
 [Back to the English README](../README.en.md) · [返回中文 README](../README.md)
+
+## Node digest implementation
+
+The Node HTTP adapter uses native SHA-256 through `node-crypto.mjs`, yielding before the first digest and after every 64 new digests so cancellation can run. UTF-8 encoding, salt concatenation, token format and per-request mappings remain unchanged. Worker and Deno retain Web Crypto; no Node dependency is added to `worker.js`. Direct `handleRequest` calls use Web Crypto unless the caller supplies the trusted internal `options.digestHex` implementation (not a request or environment setting).
